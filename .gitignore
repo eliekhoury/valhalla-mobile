@@ -38,3 +38,4 @@ libvalhalla-wrapper.so
 
 # VCPKG
 /vcpkg
+LOCAL_BINARY

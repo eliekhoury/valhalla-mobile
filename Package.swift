@@ -1,8 +1,19 @@
 // swift-tools-version:5.8
 import PackageDescription
 
-// Use the local binary if true
-let useLocalBinary = Context.environment["VALHALLA_MOBILE_DEV"].flatMap(Bool.init) ?? false
+// Use the local binary if true. Default: respect VALHALLA_MOBILE_DEV
+// env var; otherwise pull the published release. Local override file
+// `LOCAL_BINARY` (any content) lets a consuming Xcode project pin the
+// local xcframework without setting an env var on every build — the
+// flag travels with the source tree.
+let useLocalBinary: Bool = {
+    if let envFlag = Context.environment["VALHALLA_MOBILE_DEV"].flatMap(Bool.init) {
+        return envFlag
+    }
+    return FileManager.default.fileExists(
+        atPath: Context.packageDirectory + "/LOCAL_BINARY"
+    )
+}()
 
 // Use the local binary
 var binaryTarget: Target = .binaryTarget(
