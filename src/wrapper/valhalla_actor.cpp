@@ -68,11 +68,21 @@ std::string config_file(config_path);
 }
 
 std::string ValhallaActor::route(const std::string& request) {
-    // Convert the request to a std::string
-    std::string req = std::string(request);
-    
-    // Produce the route result
-    std::string result = actor->route(req);
-    
-    return result;
+    return actor->route(std::string(request));
+}
+
+std::string ValhallaActor::trace_route(const std::string& request) {
+    return actor->trace_route(std::string(request));
+}
+
+std::string ValhallaActor::trace_attributes(const std::string& request) {
+    return actor->trace_attributes(std::string(request));
+}
+
+std::string ValhallaActor::locate(const std::string& request) {
+    return actor->locate(std::string(request));
+}
+
+std::string ValhallaActor::optimized_route(const std::string& request) {
+    return actor->optimized_route(std::string(request));
 }

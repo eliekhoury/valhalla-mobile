@@ -3,12 +3,17 @@ import ValhallaModels
 import ValhallaConfigModels
 
 public protocol ValhallaProviding {
-    
+
     init(_ config: ValhallaConfig) throws
-    
+
     init(configPath: String) throws
 
     func route(request: RouteRequest) throws -> RouteResponse
+    func route(rawRequest: String) -> String
+    func traceRoute(rawRequest: String) -> String
+    func traceAttributes(rawRequest: String) -> String
+    func locate(rawRequest: String) -> String
+    func optimizedRoute(rawRequest: String) -> String
 }
 
 public final class Valhalla: ValhallaProviding {
@@ -58,5 +63,34 @@ public final class Valhalla: ValhallaProviding {
 
     public func route(rawRequest request: String) -> String {
         actor!.route(request)
+    }
+
+    /// Map matching that returns an OSRM-shape (or Valhalla-shape)
+    /// route response. Mirrors `actor->trace_route()` from Valhalla's
+    /// `tyr::actor_t`. The request body must include `shape` (the GPS
+    /// trace) and a costing.
+    public func traceRoute(rawRequest request: String) -> String {
+        actor!.traceRoute(request)
+    }
+
+    /// Map matching that returns per-edge attributes (road class,
+    /// names, durations, surface, …) along the matched path.
+    /// Mirrors `actor->trace_attributes()`.
+    public func traceAttributes(rawRequest request: String) -> String {
+        actor!.traceAttributes(request)
+    }
+
+    /// Snap a coordinate to the nearest routable edge(s). Mirrors
+    /// `actor->locate()`. Useful for finding the road the rider is
+    /// currently on without computing a full route.
+    public func locate(rawRequest request: String) -> String {
+        actor!.locate(request)
+    }
+
+    /// Compute a TSP-style ordering of the supplied locations and
+    /// return the optimized multi-waypoint route. Mirrors
+    /// `actor->optimized_route()`.
+    public func optimizedRoute(rawRequest request: String) -> String {
+        actor!.optimizedRoute(request)
     }
 }
