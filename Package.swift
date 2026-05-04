@@ -1,4 +1,5 @@
 // swift-tools-version:5.8
+import Foundation
 import PackageDescription
 
 // Use the local binary if true. Default: respect VALHALLA_MOBILE_DEV
