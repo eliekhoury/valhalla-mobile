@@ -13,6 +13,7 @@ public protocol ValhallaProviding {
     func traceRoute(rawRequest: String) -> String
     func traceAttributes(rawRequest: String) -> String
     func locate(rawRequest: String) -> String
+    func walkForward(rawRequest: String) -> String
     func optimizedRoute(rawRequest: String) -> String
 }
 
@@ -85,6 +86,17 @@ public final class Valhalla: ValhallaProviding {
     /// currently on without computing a full route.
     public func locate(rawRequest request: String) -> String {
         actor!.locate(request)
+    }
+
+    /// Graph-walk a deterministic forward corridor from (lat, lon) along
+    /// `bearing`. NOT a route: seeds the start directed edge with loki
+    /// (heading-resolved), then forward-stars edge to edge choosing the
+    /// straightest same-way continuation up to `max_distance`. Returns per-edge
+    /// way_id / names / road_class / mean_elevation / polyline6 shape. Custom fork
+    /// action — no upstream `actor->` equivalent. Request JSON keys: lat, lon,
+    /// bearing, max_distance, heading_tolerance, radius, costing.
+    public func walkForward(rawRequest request: String) -> String {
+        actor!.walkForward(request)
     }
 
     /// Compute a TSP-style ordering of the supplied locations and

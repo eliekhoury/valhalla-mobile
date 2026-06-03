@@ -104,6 +104,12 @@ std::string locate(const char *request, void* actor) {
     });
 }
 
+std::string walk_forward(const char *request, void* actor) {
+    return dispatch_action("walk_forward", [&]() {
+        return ((ValhallaActor*) actor)->walk_forward(request);
+    });
+}
+
 std::string optimized_route(const char *request, void* actor) {
     return dispatch_action("optimized_route", [&]() {
         return ((ValhallaActor*) actor)->optimized_route(request);

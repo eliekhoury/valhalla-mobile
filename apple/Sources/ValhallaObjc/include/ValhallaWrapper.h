@@ -16,6 +16,7 @@
 - (NSString*)traceRoute:(NSString*)request;
 - (NSString*)traceAttributes:(NSString*)request;
 - (NSString*)locate:(NSString*)request;
+- (NSString*)walkForward:(NSString*)request;
 - (NSString*)optimizedRoute:(NSString*)request;
 
 @end

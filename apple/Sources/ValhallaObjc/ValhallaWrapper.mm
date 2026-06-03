@@ -185,6 +185,15 @@ public:
     }
 }
 
+- (NSString*)walkForward:(NSString*)request
+{
+    @synchronized(self) {
+        std::string req = std::string([request UTF8String]);
+        std::string res = walk_forward(req.c_str(), _actor);
+        return [NSString stringWithUTF8String:res.c_str()];
+    }
+}
+
 - (NSString*)optimizedRoute:(NSString*)request
 {
     @synchronized(self) {

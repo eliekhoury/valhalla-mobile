@@ -40,6 +40,7 @@ public:
     std::string trace_route(const std::string& request);
     std::string trace_attributes(const std::string& request);
     std::string locate(const std::string& request);
+    std::string walk_forward(const std::string& request);
     std::string optimized_route(const std::string& request);
 };
 

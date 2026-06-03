@@ -26,6 +26,7 @@ std::string route(const char *request, void* actor);
 std::string trace_route(const char *request, void* actor);
 std::string trace_attributes(const char *request, void* actor);
 std::string locate(const char *request, void* actor);
+std::string walk_forward(const char *request, void* actor);
 std::string optimized_route(const char *request, void* actor);
 void* create_valhalla_actor(const char *config_path, ValhallaMobileHttpClient* http_client = nullptr);
 void delete_valhalla_actor(void* actor);
