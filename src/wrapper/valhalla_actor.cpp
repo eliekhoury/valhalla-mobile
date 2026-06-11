@@ -19,6 +19,7 @@
 #include <valhalla/sif/dynamiccost.h>
 #include <valhalla/midgard/pointll.h>
 #include <valhalla/midgard/encoded.h>
+#include <valhalla/midgard/elevation_encoding.h>
 #include <valhalla/worker.h>
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
@@ -89,16 +90,213 @@ std::string config_file(config_path);
     actor = std::make_unique<valhalla::tyr::actor_t>(config, *graph_reader, true);
 }
 
+// Per-shape-point baked elevation for one directed edge, in travel direction, PARALLEL to `shp`.
+// Mirrors the extraction in walk_forward (keep in sync): decode the edge's uniform-interval encoded
+// profile (anchored on begin/end node heights) and resample onto each shape vertex by distance; for
+// a short edge with no encoded array, ramp linearly between the two node heights. Empty when the
+// tiles carry no usable elevation. Lets route consumers read graph elevation with no DEM / map-match.
+static std::vector<float> edgeShapeElevation(
+        valhalla::baldr::GraphReader& reader,
+        const valhalla::baldr::GraphId& edge_id,
+        const valhalla::baldr::DirectedEdge* de,
+        valhalla::baldr::EdgeInfo& info,
+        valhalla::baldr::graph_tile_ptr tile,
+        const std::vector<valhalla::midgard::PointLL>& shp) {
+    using namespace valhalla;
+    using baldr::DirectedEdge; using baldr::NodeInfo; using baldr::graph_tile_ptr;
+    std::vector<float> shp_elev;
+    graph_tile_ptr bt = tile;
+    const DirectedEdge* opp = reader.GetOpposingEdge(edge_id, bt);
+    graph_tile_ptr et = tile;
+    const NodeInfo* bn = opp ? reader.nodeinfo(opp->endnode(), bt) : nullptr;
+    const NodeInfo* en = reader.nodeinfo(de->endnode(), et);
+    double interval = 0.0;
+    std::vector<int8_t> enc_elev =
+        info.has_elevation() ? info.encoded_elevation(de->length(), interval) : std::vector<int8_t>();
+    if (info.has_elevation() && bn && en && interval > 0.0 && shp.size() >= 2) {
+        std::vector<float> prof =
+            midgard::decode_elevation(enc_elev, bn->elevation(), en->elevation(), de->forward());
+        shp_elev.resize(shp.size());
+        double cum = 0.0;
+        for (size_t j = 0; j < shp.size(); ++j) {
+            if (j > 0) cum += shp[j - 1].Distance(shp[j]);
+            const double t = cum / interval;
+            const size_t k = static_cast<size_t>(t);
+            if (k + 1 < prof.size()) {
+                const double f = t - static_cast<double>(k);
+                shp_elev[j] = static_cast<float>(prof[k] * (1.0 - f) + prof[k + 1] * f);
+            } else {
+                shp_elev[j] = prof.empty() ? 0.f : prof.back();
+            }
+        }
+    } else if (bn && en && shp.size() >= 2) {
+        const float h1 = bn->elevation();
+        const float h2 = en->elevation();
+        if (h1 > -500.f && h1 < 9000.f && h2 > -500.f && h2 < 9000.f) {
+            double total = 0.0;
+            for (size_t j = 1; j < shp.size(); ++j) total += shp[j - 1].Distance(shp[j]);
+            shp_elev.resize(shp.size());
+            double cum = 0.0;
+            for (size_t j = 0; j < shp.size(); ++j) {
+                if (j > 0) cum += shp[j - 1].Distance(shp[j]);
+                const double f = total > 0.0 ? cum / total : 0.0;
+                shp_elev[j] = static_cast<float>(h1 * (1.0 - f) + h2 * f);
+            }
+        }
+    }
+    return shp_elev;
+}
+
+// Standard route, augmented: each leg gains an `edges` array (way_id + polyline6 shape + per-shape
+// BAKED elevation), so the route viewer / road-ahead / builder read graph elevation directly — no
+// DEM, no map-match. The path-edge GraphIds come from the trip proto (`edge.id`, on by default in
+// the attributes controller); elevation is extracted exactly like walk_forward. Best-effort: on any
+// parse miss we return the unmodified route.
 std::string ValhallaActor::route(const std::string& request) {
-    return actor->route(std::string(request));
+    using namespace valhalla;
+    using baldr::GraphId; using baldr::DirectedEdge; using baldr::EdgeInfo;
+    using baldr::graph_tile_ptr; using midgard::PointLL;
+
+    Api api;
+    std::string json = actor->route(std::string(request), nullptr, &api);
+
+    rapidjson::Document doc;
+    doc.Parse(json.c_str());
+    if (doc.HasParseError() || !api.has_trip()) return json;
+    const auto& trip = api.trip();
+    if (trip.routes_size() == 0) return json;
+    auto& al = doc.GetAllocator();
+    const auto& route0 = trip.routes(0);
+
+    // Locate the legs array to augment — trip format (`trip.legs`) or OSRM (`routes[0].legs`),
+    // whichever this response is. The Api trip is format-independent, so the per-leg edges we
+    // build from it apply to either; we just inject into the matching JSON shape. Augmenting OSRM
+    // lets the app read graph elevation from the SAME route it already computes for nav — no extra
+    // round trip. (Only the primary route[0]; alternates aren't elevation-consumed.)
+    rapidjson::Value* jlegsPtr = nullptr;
+    if (doc.HasMember("trip") && doc["trip"].IsObject() &&
+        doc["trip"].HasMember("legs") && doc["trip"]["legs"].IsArray()) {
+        jlegsPtr = &doc["trip"]["legs"];
+    } else if (doc.HasMember("routes") && doc["routes"].IsArray() && !doc["routes"].Empty() &&
+               doc["routes"][0].IsObject() &&
+               doc["routes"][0].HasMember("legs") && doc["routes"][0]["legs"].IsArray()) {
+        jlegsPtr = &doc["routes"][0]["legs"];
+    }
+    if (jlegsPtr == nullptr) return json;
+    auto& jlegs = *jlegsPtr;
+
+    graph_tile_ptr tile = nullptr;
+    const int legs = std::min<int>(route0.legs_size(), (int)jlegs.Size());
+    for (int li = 0; li < legs; ++li) {
+        const auto& leg = route0.legs(li);
+        rapidjson::Value edges(rapidjson::kArrayType);
+        bool firstEdge = true;
+        for (int ni = 0; ni + 1 < leg.node_size(); ++ni) {   // last node is the destination, no edge
+            const auto& node = leg.node(ni);
+            if (!node.has_edge()) continue;
+            GraphId eid(node.edge().id());
+            if (!eid.is_valid()) continue;
+            const DirectedEdge* de = graph_reader->directededge(eid, tile);
+            if (!de) continue;
+            EdgeInfo info = tile->edgeinfo(de);
+            std::vector<PointLL> shp = info.shape();
+            if (!de->forward()) std::reverse(shp.begin(), shp.end());
+            std::vector<float> shp_elev = edgeShapeElevation(*graph_reader, eid, de, info, tile, shp);
+            if (!firstEdge && !shp.empty()) {                 // dedup the shared junction vertex
+                shp.erase(shp.begin());
+                if (!shp_elev.empty()) shp_elev.erase(shp_elev.begin());
+            }
+            firstEdge = false;
+            rapidjson::Value e(rapidjson::kObjectType);
+            e.AddMember("way_id", (uint64_t)info.wayid(), al);
+            e.AddMember("length_m", (uint32_t)de->length(), al);
+            e.AddMember("bridge", de->bridge(), al);
+            e.AddMember("tunnel", de->tunnel(), al);
+            std::string enc = midgard::encode<std::vector<PointLL>>(shp, 1e6);
+            rapidjson::Value shape; shape.SetString(enc.c_str(), (rapidjson::SizeType)enc.size(), al);
+            e.AddMember("shape", shape, al);
+            if (!shp_elev.empty()) {
+                rapidjson::Value evarr(rapidjson::kArrayType);
+                for (float h : shp_elev) evarr.PushBack(h, al);
+                e.AddMember("elevation", evarr, al);
+            }
+            edges.PushBack(e, al);
+        }
+        jlegs[li].AddMember("edges", edges, al);
+    }
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> w(sb);
+    doc.Accept(w);
+    return std::string(sb.GetString(), sb.GetSize());
 }
 
 std::string ValhallaActor::trace_route(const std::string& request) {
     return actor->trace_route(std::string(request));
 }
 
+// Map-match + per-shape BAKED graph elevation. The app uses this to give a fixed polyline (a
+// segment) a graph-sourced elevation profile with no DEM: match the polyline to the routing graph
+// and emit each matched edge's shape + per-shape elevation (same extraction as walk_forward/route).
+// Added as a top-level `graph_edges` array so the stock trace_attributes payload is untouched.
+// NOTE: needs `edge.id` populated in the trip — the app's request must not filter it out (default
+// controller includes it). Empty `graph_edges` (no edge ids / no elevation) → app falls back.
 std::string ValhallaActor::trace_attributes(const std::string& request) {
-    return actor->trace_attributes(std::string(request));
+    using namespace valhalla;
+    using baldr::GraphId; using baldr::DirectedEdge; using baldr::EdgeInfo;
+    using baldr::graph_tile_ptr; using midgard::PointLL;
+
+    Api api;
+    std::string json = actor->trace_attributes(std::string(request), nullptr, &api);
+
+    rapidjson::Document doc;
+    doc.Parse(json.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !api.has_trip()) return json;
+    const auto& trip = api.trip();
+    if (trip.routes_size() == 0) return json;
+    auto& al = doc.GetAllocator();
+    const auto& route0 = trip.routes(0);
+
+    rapidjson::Value graphEdges(rapidjson::kArrayType);
+    graph_tile_ptr tile = nullptr;
+    bool firstEdge = true;
+    for (int li = 0; li < route0.legs_size(); ++li) {
+        const auto& leg = route0.legs(li);
+        for (int ni = 0; ni + 1 < leg.node_size(); ++ni) {   // last node = end, no edge
+            const auto& node = leg.node(ni);
+            if (!node.has_edge()) continue;
+            GraphId eid(node.edge().id());
+            if (!eid.is_valid()) continue;
+            const DirectedEdge* de = graph_reader->directededge(eid, tile);
+            if (!de) continue;
+            EdgeInfo info = tile->edgeinfo(de);
+            std::vector<PointLL> shp = info.shape();
+            if (!de->forward()) std::reverse(shp.begin(), shp.end());
+            std::vector<float> shp_elev = edgeShapeElevation(*graph_reader, eid, de, info, tile, shp);
+            if (!firstEdge && !shp.empty()) {                 // dedup the shared junction vertex
+                shp.erase(shp.begin());
+                if (!shp_elev.empty()) shp_elev.erase(shp_elev.begin());
+            }
+            firstEdge = false;
+            rapidjson::Value e(rapidjson::kObjectType);
+            e.AddMember("way_id", (uint64_t)info.wayid(), al);
+            std::string enc = midgard::encode<std::vector<PointLL>>(shp, 1e6);
+            rapidjson::Value shape; shape.SetString(enc.c_str(), (rapidjson::SizeType)enc.size(), al);
+            e.AddMember("shape", shape, al);
+            if (!shp_elev.empty()) {
+                rapidjson::Value evarr(rapidjson::kArrayType);
+                for (float h : shp_elev) evarr.PushBack(h, al);
+                e.AddMember("elevation", evarr, al);
+            }
+            graphEdges.PushBack(e, al);
+        }
+    }
+    doc.AddMember("graph_edges", graphEdges, al);
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> w(sb);
+    doc.Accept(w);
+    return std::string(sb.GetString(), sb.GetSize());
 }
 
 std::string ValhallaActor::locate(const std::string& request) {
@@ -175,11 +373,75 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         // (before the start is trimmed) — drives the straightness of the next choice.
         const double arrive_heading = (shp.size() >= 2)
             ? PointLL::HeadingAtEndOfPolyline(shp, 20.0) : inbound_heading;
+
+        // Per-shape-point elevation (meters, travel direction), PARALLEL to `shp`, so the
+        // app zips coord+elevation with no DEM lookup. Decode the edge's uniform-interval
+        // profile (anchored on the begin/end node heights) and resample it onto each shape
+        // vertex by its distance along the edge. Bridges/tunnels were interpolated at build
+        // time, so they come through correct. Empty when the tiles carry no elevation.
+        std::vector<float> shp_elev;
+        {
+            // Begin/end node heights — needed by BOTH the encoded path and the short-edge
+            // ramp, so fetch them once up front. The begin node is the opposing edge's end.
+            graph_tile_ptr bt = tile;
+            const DirectedEdge* opp = graph_reader->GetOpposingEdge(edge_id, bt);
+            graph_tile_ptr et = tile;
+            const NodeInfo* bn = opp ? graph_reader->nodeinfo(opp->endnode(), bt) : nullptr;
+            const NodeInfo* en = graph_reader->nodeinfo(de->endnode(), et);
+            double interval = 0.0;
+            std::vector<int8_t> enc_elev =
+                info.has_elevation() ? info.encoded_elevation(de->length(), interval)
+                                     : std::vector<int8_t>();
+            if (info.has_elevation() && bn && en && interval > 0.0 && shp.size() >= 2) {
+                // Long edge: decode the per-vertex delta profile and resample it onto each
+                // shape vertex by distance along the edge.
+                std::vector<float> prof =
+                    midgard::decode_elevation(enc_elev, bn->elevation(), en->elevation(), de->forward());
+                shp_elev.resize(shp.size());
+                double cum = 0.0;
+                for (size_t j = 0; j < shp.size(); ++j) {
+                    if (j > 0) cum += shp[j - 1].Distance(shp[j]);   // meters along the edge
+                    const double t = cum / interval;
+                    const size_t k = static_cast<size_t>(t);
+                    if (k + 1 < prof.size()) {
+                        const double f = t - static_cast<double>(k);
+                        shp_elev[j] = static_cast<float>(prof[k] * (1.0 - f) + prof[k + 1] * f);
+                    } else {
+                        shp_elev[j] = prof.empty() ? 0.f : prof.back();
+                    }
+                }
+            } else if (bn && en && shp.size() >= 2) {
+                // Short edge (< the ~32 m sampling interval) carries NO encoded array — its
+                // profile is fully the two endpoint NodeInfo heights. Synthesize a linear
+                // ramp between them (same anchoring decode_elevation uses: shp.front() = begin
+                // node, shp.back() = end node). Exact for sub-32 m edges. This is what makes
+                // EVERY emitted edge carry elevation, so the app never falls back to a DEM.
+                const float h1 = bn->elevation();
+                const float h2 = en->elevation();
+                if (h1 > -500.f && h1 < 9000.f && h2 > -500.f && h2 < 9000.f) {   // skip no-data
+                    double total = 0.0;
+                    for (size_t j = 1; j < shp.size(); ++j) total += shp[j - 1].Distance(shp[j]);
+                    shp_elev.resize(shp.size());
+                    double cum = 0.0;
+                    for (size_t j = 0; j < shp.size(); ++j) {
+                        if (j > 0) cum += shp[j - 1].Distance(shp[j]);
+                        const double f = total > 0.0 ? cum / total : 0.0;
+                        shp_elev[j] = static_cast<float>(h1 * (1.0 - f) + h2 * f);
+                    }
+                }
+            }
+        }
+
+        // Trim shape AND its parallel elevation in lockstep so they stay aligned.
         if (first && start_pct > 0.0 && shp.size() >= 2) {
             size_t drop = static_cast<size_t>(start_pct * (shp.size() - 1));
-            if (drop > 0 && drop < shp.size()) shp.erase(shp.begin(), shp.begin() + drop);
+            if (drop > 0 && drop < shp.size()) {
+                shp.erase(shp.begin(), shp.begin() + drop);
+                if (!shp_elev.empty()) shp_elev.erase(shp_elev.begin(), shp_elev.begin() + drop);
+            }
         } else if (!first && !shp.empty()) {
             shp.erase(shp.begin());                    // dedup shared junction vertex
+            if (!shp_elev.empty()) shp_elev.erase(shp_elev.begin());
         }
 
         rapidjson::Value e(rapidjson::kObjectType);
@@ -187,8 +449,9 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         e.AddMember("length_m", (uint32_t)de->length(), al);
         e.AddMember("road_class", (int)de->classification(), al);
         e.AddMember("use", (int)de->use(), al);
-        if (info.has_elevation())
-            e.AddMember("mean_elevation", info.mean_elevation(), al);
+        e.AddMember("bridge", de->bridge(), al);
+        e.AddMember("tunnel", de->tunnel(), al);
+        e.AddMember("mean_elevation", info.mean_elevation(), al);   // set unconditionally at build time
         rapidjson::Value names(rapidjson::kArrayType);
         for (const auto& n : info.GetNames()) {
             rapidjson::Value s; s.SetString(n.c_str(), (rapidjson::SizeType)n.size(), al);
@@ -198,6 +461,11 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         std::string enc = midgard::encode<std::vector<PointLL>>(shp, 1e6);
         rapidjson::Value shape; shape.SetString(enc.c_str(), (rapidjson::SizeType)enc.size(), al);
         e.AddMember("shape", shape, al);
+        if (!shp_elev.empty()) {
+            rapidjson::Value evarr(rapidjson::kArrayType);
+            for (float h : shp_elev) evarr.PushBack(h, al);
+            e.AddMember("elevation", evarr, al);       // meters, one value per shape point
+        }
         edges.PushBack(e, al);
 
         traveled += de->length() * (first ? (1.0 - start_pct) : 1.0);
