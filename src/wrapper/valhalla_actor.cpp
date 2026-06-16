@@ -86,8 +86,13 @@ std::string config_file(config_path);
       mjolnir_config, 
       std::make_unique<TileGetterWrapper>(http_client, mjolnir_config.get<bool>("tile_url_gz", false))
     );
-    // Setup the actor
-    actor = std::make_unique<valhalla::tyr::actor_t>(config, *graph_reader, true);
+    // Setup the actor. auto_cleanup = FALSE: cleanup() clears the SHARED graph_reader's tile
+    // cache after every action, but our route()/trace_attributes() augmentations read per-edge
+    // BAKED elevation from that same reader AFTER the action returns — with cleanup on, those
+    // reads hit an empty cache and silently drop elevation (intermittent "route loads, elevation
+    // doesn't"). The reader's own LRU (mjolnir.max_cache_size) bounds memory, so cleanup is
+    // redundant here and actively harmful. Keep the cache warm.
+    actor = std::make_unique<valhalla::tyr::actor_t>(config, *graph_reader, false);
 }
 
 // Per-shape-point baked elevation for one directed edge, in travel direction, PARALLEL to `shp`.
@@ -156,6 +161,13 @@ std::string ValhallaActor::route(const std::string& request) {
     using namespace valhalla;
     using baldr::GraphId; using baldr::DirectedEdge; using baldr::EdgeInfo;
     using baldr::graph_tile_ptr; using midgard::PointLL;
+
+    // The actor is built with auto_cleanup=false so its per-request cleanup() doesn't wipe worker
+    // state BEFORE our elevation augmentation below reads the trip + graph. But cleanup() is still
+    // required between requests (resetting the path algorithms; trimming the tile cache when over
+    // budget) — skipping it accumulates state and crashes after a few routes. So run it ourselves
+    // AFTER the augmentation, on every return path, via this scope guard.
+    struct ActorCleaner { tyr::actor_t* a; ~ActorCleaner() { a->cleanup(); } } _cleaner{actor.get()};
 
     Api api;
     std::string json = actor->route(std::string(request), nullptr, &api);
@@ -245,6 +257,10 @@ std::string ValhallaActor::trace_attributes(const std::string& request) {
     using namespace valhalla;
     using baldr::GraphId; using baldr::DirectedEdge; using baldr::EdgeInfo;
     using baldr::graph_tile_ptr; using midgard::PointLL;
+
+    // See route(): cleanup AFTER our augmentation reads, on every return path, since auto_cleanup
+    // is off (so the read sees intact state) but the engine still needs the per-request reset.
+    struct ActorCleaner { tyr::actor_t* a; ~ActorCleaner() { a->cleanup(); } } _cleaner{actor.get()};
 
     Api api;
     std::string json = actor->trace_attributes(std::string(request), nullptr, &api);
