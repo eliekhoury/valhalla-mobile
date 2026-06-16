@@ -152,12 +152,53 @@ public:
 - (NSString*)route:(NSString*)request
 {
     @synchronized(self) {
-        // Convert the NSString to std::string
         std::string req = std::string([request UTF8String]);
-        
-        // Generate the valhalla response
         std::string res = route(req.c_str(), _actor);
-        
+        return [NSString stringWithUTF8String:res.c_str()];
+    }
+}
+
+- (NSString*)traceRoute:(NSString*)request
+{
+    @synchronized(self) {
+        std::string req = std::string([request UTF8String]);
+        std::string res = trace_route(req.c_str(), _actor);
+        return [NSString stringWithUTF8String:res.c_str()];
+    }
+}
+
+- (NSString*)traceAttributes:(NSString*)request
+{
+    @synchronized(self) {
+        std::string req = std::string([request UTF8String]);
+        std::string res = trace_attributes(req.c_str(), _actor);
+        return [NSString stringWithUTF8String:res.c_str()];
+    }
+}
+
+- (NSString*)locate:(NSString*)request
+{
+    @synchronized(self) {
+        std::string req = std::string([request UTF8String]);
+        std::string res = locate(req.c_str(), _actor);
+        return [NSString stringWithUTF8String:res.c_str()];
+    }
+}
+
+- (NSString*)walkForward:(NSString*)request
+{
+    @synchronized(self) {
+        std::string req = std::string([request UTF8String]);
+        std::string res = walk_forward(req.c_str(), _actor);
+        return [NSString stringWithUTF8String:res.c_str()];
+    }
+}
+
+- (NSString*)optimizedRoute:(NSString*)request
+{
+    @synchronized(self) {
+        std::string req = std::string([request UTF8String]);
+        std::string res = optimized_route(req.c_str(), _actor);
         return [NSString stringWithUTF8String:res.c_str()];
     }
 }
