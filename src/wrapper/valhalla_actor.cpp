@@ -24,6 +24,7 @@
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
+#include <string>
 #include <unordered_set>
 #include <algorithm>
 
@@ -339,8 +340,11 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
     const float  heading_tol  = doc.HasMember("heading_tolerance") ? doc["heading_tolerance"].GetFloat() : 45.f;
     const double radius       = doc.HasMember("radius") ? doc["radius"].GetDouble() : 30.0;
     const bool   dbg          = doc.HasMember("debug") && doc["debug"].GetBool();
-    if (dbg) fprintf(stderr, "[WF] enter lat=%.5f lon=%.5f bearing=%.0f maxd=%.0f\n",
-                     lat, lon, bearing, max_distance);
+    // Degrees of accumulated same-way turning at which the same-way bonus has faded to nothing.
+    // 0 leaves the bonus flat, which is what this action shipped with. See the scoring below.
+    const double loop_turn    = doc.HasMember("loop_turn") ? doc["loop_turn"].GetDouble() : 0.0;
+    if (dbg) fprintf(stderr, "[WF] enter lat=%.5f lon=%.5f bearing=%.0f maxd=%.0f loop_turn=%.0f\n",
+                     lat, lon, bearing, max_distance, loop_turn);
 
     // 1. costing (drives Allowed() + loki heading/access filtering)
     Api api;
@@ -375,11 +379,19 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
     std::unordered_set<GraphId> visited;
     double traveled = 0; bool first = true;
     double inbound_heading = bearing;
+    // Signed degrees turned since the way id last changed, and the way it belongs to.
+    double way_turn = 0; uint64_t prev_way = 0;
+    // Why the walk ended where it did. Without this a short corridor is a mystery: it looks
+    // the same whether the ask was met, the road ran out, or we refused everything on offer.
+    std::string stop = "distance";
 
-    while (traveled < max_distance && edge_id.is_valid() && !visited.count(edge_id)) {
+    while (true) {
+        if (traveled >= max_distance) { stop = "distance"; break; }
+        if (!edge_id.is_valid())      { stop = "no_edge";  break; }
+        if (visited.count(edge_id))   { stop = "loop";     break; }
         visited.insert(edge_id);
         const DirectedEdge* de = graph_reader->directededge(edge_id, tile);
-        if (!de) break;                                // null tile = end of reachable graph
+        if (!de) { stop = "null_tile"; break; }        // null tile = end of reachable graph
         EdgeInfo info = tile->edgeinfo(de);
 
         // shape: copy out before tile may swap; honor forward() orientation
@@ -389,6 +401,18 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         // (before the start is trimmed) — drives the straightness of the next choice.
         const double arrive_heading = (shp.size() >= 2)
             ? PointLL::HeadingAtEndOfPolyline(shp, 20.0) : inbound_heading;
+        // Turning accumulated while the way id has not changed, signed, so a switchback road
+        // (which alternates and cancels) reads as straight and a loop (which accumulates in one
+        // direction) reads as the circle it is. Reset whenever we step onto a different way.
+        if (!first && info.wayid() == prev_way) {
+            double d = arrive_heading - inbound_heading;
+            while (d >  180.0) d -= 360.0;
+            while (d < -180.0) d += 360.0;
+            way_turn += d;
+        } else {
+            way_turn = 0;
+        }
+        prev_way = info.wayid();
 
         // Per-shape-point elevation (meters, travel direction), PARALLEL to `shp`, so the
         // app zips coord+elevation with no DEM lookup. Decode the edge's uniform-interval
@@ -492,7 +516,7 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         GraphId node_id = de->endnode();
         graph_tile_ptr ntile = tile;
         const NodeInfo* node = graph_reader->nodeinfo(node_id, ntile);
-        if (!node) break;
+        if (!node) { stop = "no_node"; break; }
         const GraphId opp = graph_reader->GetOpposingEdgeId(edge_id);
         const uint32_t first_e = node->edge_index();
         const uint32_t cnt = node->edge_count();
@@ -502,6 +526,7 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         // preference (stay on a comparable road; penalize dropping onto a service
         // road / driveway / path off a real road), and a small bike-friendly nudge.
         GraphId best; double best_score = -1e9;
+        int refused = 0, uturns = 0;
         const uint64_t cur_way = info.wayid();
         const int cur_class = static_cast<int>(de->classification());
         if (dbg) {
@@ -518,9 +543,9 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
 
             const bool is_sc = c->is_shortcut();                 // collapsed through-chain (arterial/highway)
             const char* skip = nullptr;
-            if (cid == opp) skip = "uturn";                      // no U-turn
-            else if (c->IsTransitLine() || c->use() == baldr::Use::kTransitConnection) skip = "transit";
-            else if (!is_sc && !costing->Allowed(c, ntile)) skip = "not-allowed";  // shortcuts recovered to local below
+            if (cid == opp) { skip = "uturn"; ++uturns; }        // no U-turn
+            else if (c->IsTransitLine() || c->use() == baldr::Use::kTransitConnection) { skip = "transit"; ++refused; }
+            else if (!is_sc && !costing->Allowed(c, ntile)) { skip = "not-allowed"; ++refused; }  // shortcuts recovered to local below
             if (skip) {
                 if (dbg) fprintf(stderr, "[WF]    skip \"%s\" way=%llu cls=%d (%s)\n",
                                 cn.c_str(), (unsigned long long)cinfo.wayid(), cc, skip);
@@ -537,7 +562,17 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
             const double diff = std::abs(ch - inbound_heading);
             const double turn = std::min(diff, 360.0 - diff);    // 0..180 deviation from straight
             double score = 180.0 - turn;                         // straighter = higher
-            if (cinfo.wayid() == cur_way) score += 120.0;        // same OSM way continues the road
+            if (cinfo.wayid() == cur_way) {
+                // The same OSM way continues the road -- but that is a claim about a road going
+                // somewhere, and a way that has already bent right round is not going anywhere.
+                // A CLOSED way (a loop road, a roundabout) otherwise beats every exit it offers,
+                // because 120 is larger than any turn penalty, so the walk circles it and stops
+                // when it meets itself. That ended 46 of the first 60 corridors on one real ride
+                // and is why the climb underneath the rider had no visible top.
+                double bonus = 120.0;
+                if (loop_turn > 0.0) bonus *= std::max(0.0, 1.0 - std::abs(way_turn) / loop_turn);
+                score += bonus;
+            }
             if (cc == cur_class) score += 40.0;
             else if (cc > cur_class) score -= double(cc - cur_class) * 20.0;  // bigger ordinal = smaller road
             if (c->use() == baldr::Use::kCycleway || c->bike_network()) score += 30.0;
@@ -546,7 +581,11 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
                             cn.c_str(), (unsigned long long)cinfo.wayid(), cc, ch, turn, score);
             if (score > best_score) { best_score = score; best = cid; }
         }
-        if (!best.is_valid()) { if (dbg) fprintf(stderr, "[WF] -> dead end\n"); break; }   // dead end
+        if (!best.is_valid()) {                        // nothing to continue onto
+            stop = refused ? "refused" : (uturns ? "uturn_only" : "no_edges");
+            if (dbg) fprintf(stderr, "[WF] -> dead end (%s)\n", stop.c_str());
+            break;
+        }
         // If the chosen continuation is a shortcut (a forced through-chain collapsed on
         // the arterial/highway hierarchy, way_id=0), recover its constituent LOCAL edges
         // and resume there: the local level carries full detail and has no shortcuts, so
@@ -567,6 +606,12 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
 
     out.AddMember("edges", edges, al);
     out.AddMember("traveled_m", traveled, al);
+    // distance (the ask was met) / loop (the best continuation was road we had already walked) /
+    // refused, uturn_only, no_edges (nothing on offer) / no_node, null_tile (the graph ends).
+    {
+        rapidjson::Value v; v.SetString(stop.c_str(), (rapidjson::SizeType)stop.size(), al);
+        out.AddMember("stop", v, al);
+    }
     rapidjson::StringBuffer sb; rapidjson::Writer<rapidjson::StringBuffer> w(sb);
     out.Accept(w);
     return sb.GetString();
