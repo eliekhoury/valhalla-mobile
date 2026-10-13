@@ -61,6 +61,13 @@ fi
 platform=""
 arch=""
 clean=false
+# Without this default, `if $clean_all; then` at line ~106 expands to
+# `if ; then` (empty command) which evaluates *true* in bash and wipes
+# `build/` on every invocation. CI doesn't hit this because each
+# matrix runner builds one arch in a fresh checkout, but local
+# sequential `./build.sh --ios <arch1>` then `./build.sh --ios <arch2>`
+# loses the first arch's artifacts.
+clean_all=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in

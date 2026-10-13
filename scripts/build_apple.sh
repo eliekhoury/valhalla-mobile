@@ -37,7 +37,7 @@ elif [ "$1" == "x64-ios-simulator" ]; then
 elif [ "$1" == "macos" ]; then
     sdk=macosx
     system_name=Darwin
-    min_deployment_target=10.14
+    min_deployment_target=13.0
     arch=arm64 # TODO: Add x86_64 for older macs?
     vcpkg_target_triplet=arm64-osx # TODO: Try the normal one that's not in the community releases.
 elif [ "$1" == "tvos" ]; then
