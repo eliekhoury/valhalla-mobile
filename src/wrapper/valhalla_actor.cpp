@@ -489,6 +489,9 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         e.AddMember("length_m", (uint32_t)de->length(), al);
         e.AddMember("road_class", (int)de->classification(), al);
         e.AddMember("use", (int)de->use(), al);
+        // Surface ordinal (baldr::Surface: 0 paved_smooth .. 7 impassable), so the rider's road type
+        // bar can say Gravel for the road ahead the way trace_attributes lets the planner say it.
+        e.AddMember("surface", (int)de->surface(), al);
         e.AddMember("bridge", de->bridge(), al);
         e.AddMember("tunnel", de->tunnel(), al);
         e.AddMember("mean_elevation", info.mean_elevation(), al);   // set unconditionally at build time
