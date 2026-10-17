@@ -1,8 +1,8 @@
 diff --git a/proto/options.proto b/proto/options.proto
-index 65a4f5aca..a7c551e50 100644
+index 65a4f5aca..a85123b5c 100644
 --- a/proto/options.proto
 +++ b/proto/options.proto
-@@ -350,6 +350,12 @@ message Costing {
+@@ -350,6 +350,15 @@ message Costing {
      map<uint32, HierarchyLimits> hierarchy_limits = 92;
      bool ignore_construction = 93;
      repeated CostFactorEdge cost_factor_edges = 94;     // identified edges along user provided linear features, to which to apply special cost factors
@@ -12,11 +12,14 @@ index 65a4f5aca..a7c551e50 100644
 +    // Bike IQ (bicycle): added cost per Surface (7, kPavedSmooth to kPath). Replaces the
 +    // avoid_bad_surfaces penalty, which can avoid a rough surface but never prefer one.
 +    repeated float surface_factors = 9002;
++    // Bike IQ (bicycle): added cost per weighted grade band (16, -10% to +15%). Replaces the
++    // use_hills penalty, which can avoid climbing but never seek it.
++    repeated float grade_factors = 9003;
      oneof has_speed_penalty_factor {
            float speed_penalty_factor = 95;
          }
 diff --git a/src/sif/bicyclecost.cc b/src/sif/bicyclecost.cc
-index fb66e1434..f52ae04b6 100644
+index fb66e1434..c152a1438 100644
 --- a/src/sif/bicyclecost.cc
 +++ b/src/sif/bicyclecost.cc
 @@ -7,7 +7,10 @@
@@ -65,7 +68,21 @@ index fb66e1434..f52ae04b6 100644
    // Willingness to use roads. Make sure this is within range [0, 1].
    use_roads_ = costing_options.use_roads();
    avoid_roads_ = 1.0f - use_roads_;
-@@ -647,7 +671,20 @@ Cost BicycleCost::EdgeCost(const baldr::DirectedEdge* edge,
+@@ -547,6 +571,13 @@ BicycleCost::BicycleCost(const Costing& costing)
+   for (uint32_t i = 0; i <= kMaxGradeFactor; i++) {
+     grade_penalty[i] = avoid_hills * kAvoidHillsStrength[i];
+   }
++  // Bike IQ: the rider's grade table replaces it whole, so a route can seek climbs.
++  const auto& grades = costing_options.grade_factors();
++  if (static_cast<uint32_t>(grades.size()) == kMaxGradeFactor + 1 &&
++      std::all_of(grades.begin(), grades.end(),
++                  [](float v) { return std::isfinite(v) && v >= 0.0f; })) {
++    std::copy(grades.begin(), grades.end(), grade_penalty);
++  }
+ 
+   use_hierarchy_limits = false;
+ }
+@@ -647,7 +678,20 @@ Cost BicycleCost::EdgeCost(const baldr::DirectedEdge* edge,
    float accommodation_factor = 1.0f;
  
    // Special use cases: cycleway, footway, path, living street, track
@@ -87,7 +104,7 @@ index fb66e1434..f52ae04b6 100644
      // Differentiate how segregated the cycleway/path is from pedestrians
      accommodation_factor = path_cyclelane_factor_[static_cast<uint32_t>(edge->cyclelane())];
    } else if (edge->use() == Use::kMountainBike && type_ == BicycleType::kMountain) {
-@@ -699,7 +736,11 @@ Cost BicycleCost::EdgeCost(const baldr::DirectedEdge* edge,
+@@ -699,7 +743,11 @@ Cost BicycleCost::EdgeCost(const baldr::DirectedEdge* edge,
        1.0f + grade_penalty[edge->weighted_grade()] + (accommodation_factor * roadway_stress);
  
    // If surface is worse than the minimum we add a surface factor
@@ -100,7 +117,7 @@ index fb66e1434..f52ae04b6 100644
      factor +=
          avoid_bad_surfaces_ * kSurfaceFactors[static_cast<uint32_t>(edge->surface()) -
                                                static_cast<uint32_t>(minimal_surface_penalized_)];
-@@ -913,6 +954,25 @@ void ParseBicycleCostOptions(const rapidjson::Document& doc,
+@@ -913,6 +961,26 @@ void ParseBicycleCostOptions(const rapidjson::Document& doc,
    JSON_PBF_RANGED_DEFAULT(co, kCycleSpeedRange, json, "/cycling_speed", cycling_speed);
    JSON_PBF_RANGED_DEFAULT(co, kBSSCostRange, json, "/bss_return_cost", bike_share_cost);
    JSON_PBF_RANGED_DEFAULT(co, kBSSPenaltyRange, json, "/bss_return_penalty", bike_share_penalty);
@@ -123,6 +140,7 @@ index fb66e1434..f52ae04b6 100644
 +  };
 +  read_floats("/road_class_factors", co->mutable_road_class_factors());
 +  read_floats("/surface_factors", co->mutable_surface_factors());
++  read_floats("/grade_factors", co->mutable_grade_factors());
  }
  
  cost_ptr_t CreateBicycleCost(const Costing& costing_options) {
