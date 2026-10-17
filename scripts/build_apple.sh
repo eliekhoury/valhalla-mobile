@@ -67,6 +67,18 @@ fi
 build_dir=`pwd`/build/apple/$vcpkg_target_triplet
 wrapper_dir=`pwd`/src
 
+# Bike IQ patches to the Valhalla core (src/valhalla stays upstream). Each applies once: a patch
+# already in the tree is skipped, one that no longer applies stops the build.
+for patch in `pwd`/patches/valhalla/*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C src/valhalla apply --reverse --check "$patch" 2>/dev/null; then
+        echo "Valhalla patch already applied: $(basename "$patch")"
+    else
+        git -C src/valhalla apply "$patch" || { echo "Valhalla patch failed: $patch"; exit 1; }
+        echo "Applied Valhalla patch: $(basename "$patch")"
+    fi
+done
+
 # Move to the build directory
 mkdir -p $build_dir && cd $build_dir
 
