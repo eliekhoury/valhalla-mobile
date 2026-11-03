@@ -1,0 +1,48 @@
+diff --git a/valhalla/sif/dynamiccost.h b/valhalla/sif/dynamiccost.h
+index 449aead06..69a8282dd 100644
+--- a/valhalla/sif/dynamiccost.h
++++ b/valhalla/sif/dynamiccost.h
+@@ -396,8 +396,11 @@ public:
+                               const baldr::graph_tile_ptr&,
+                               uint16_t disallow_mask = kDisallowNone) const {
+     auto access_mask = (ignore_access_ ? baldr::kAllAccess : access_mask_);
+-    bool accessible = (edge->forwardaccess() & access_mask) ||
+-                      (ignore_oneways_ && (edge->reverseaccess() & access_mask));
++    // Bike IQ: as in IsAccessible, ignoring access does not open the wrong side of a one-way.
++    bool against_oneway = ignore_access_ && !ignore_oneways_ &&
++                          !(edge->forwardaccess() & access_mask_) && IsAgainstOneway(edge);
++    bool accessible = !against_oneway && ((edge->forwardaccess() & access_mask) ||
++                                          (ignore_oneways_ && (edge->reverseaccess() & access_mask)));
+     bool assumed_restricted =
+         ((disallow_mask & kDisallowStartRestriction) && edge->start_restriction()) ||
+         ((disallow_mask & kDisallowEndRestriction) && edge->end_restriction()) ||
+@@ -418,13 +421,28 @@ public:
+     // you have forward access for the mode you care about
+     // you dont care about what mode has access so long as its forward
+     // you dont care about the direction the mode has access to
++    // Bike IQ: ignoring access lifts WHO may use an edge, never which WAY. A pedestrian may walk a
++    // one-way in both directions, so "any mode has forward access" alone let a bicycle with
++    // ignore_access ride a divided road's carriageway against traffic. The wrong side of a one-way
++    // stays closed unless ignore_oneways is set too.
+     return (edge->forwardaccess() & access_mask_) ||
+-           (ignore_access_ && (edge->forwardaccess() & baldr::kAllAccess)) ||
++           (ignore_access_ && (edge->forwardaccess() & baldr::kAllAccess) &&
++            (ignore_oneways_ || !IsAgainstOneway(edge))) ||
+            (ignore_oneways_ && (edge->reverseaccess() & access_mask_)) ||
+            // OR it is under construction but you choose to ignore that
+            (ignore_construction_ && edge->use() == baldr::Use::kConstruction);
+   }
+ 
++  /**
++   * Bike IQ: is this edge the wrong side of a one-way? No vehicle or bicycle may use it in this
++   * direction, but traffic may in the other. (A direction open to pedestrians alone is how
++   * Valhalla stores a one-way road's wrong side.)
++   */
++  static inline bool IsAgainstOneway(const baldr::DirectedEdge* edge) {
++    constexpr uint16_t kTraffic = baldr::kVehicularAccess | baldr::kBicycleAccess;
++    return !(edge->forwardaccess() & kTraffic) && (edge->reverseaccess() & kTraffic);
++  }
++
+   inline virtual bool ModeSpecificAllowed(const baldr::AccessRestriction&) const {
+     return true;
+   }
