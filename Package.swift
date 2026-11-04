@@ -25,10 +25,10 @@ var binaryTarget: Target = .binaryTarget(
 // CI will replace the nils with the actual values when building a release
 // Bike IQ fork: pinned to our extended-actions release on the eliekhoury
 // fork until the upstream PR merges and a new Rallista release is cut.
-let version: String = "0.5.1-bikeiq.7"
+let version: String = "0.5.1-bikeiq.8"
 let binaryURL: String =
     "https://github.com/eliekhoury/valhalla-mobile/releases/download/\(version)/valhalla-wrapper.xcframework.zip"
-let binaryChecksum: String = "dcc6a5baa93b49eec1bf3c178aee498c8570eebb86eab4a8550f752454f7cc1d"
+let binaryChecksum: String = "0520765e64ab95b81c58ff17d3829a0064fdd267bb9178684cfa27504b3a7f6d"
 
 if !useLocalBinary {
     binaryTarget = .binaryTarget(
