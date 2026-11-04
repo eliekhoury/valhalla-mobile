@@ -1,3 +1,4 @@
+#include <cmath>
 #include <boost/property_tree/ptree.hpp>
 #include <valhalla/tyr/actor.h>
 #include <valhalla/baldr/rapidjson_utils.h>
@@ -94,6 +95,14 @@ std::string config_file(config_path);
     // doesn't"). The reader's own LRU (mjolnir.max_cache_size) bounds memory, so cleanup is
     // redundant here and actively harmful. Keep the cache warm.
     actor = std::make_unique<valhalla::tyr::actor_t>(config, *graph_reader, false);
+}
+
+// A height as the JSON carries it: to the centimetre. The tiles store heights in 0.25 m steps and
+// everything past that is interpolation, but a float handed to rapidjson is written as the double it
+// widens to, so 88.7 went out as 88.69999694824219: 15 characters a vertex where 5 say the same,
+// about a quarter of a route response, parsed again by the app on every route, walk and match.
+static double elevationOut(float h) {
+    return std::round(static_cast<double>(h) * 100.0) / 100.0;
 }
 
 // Per-shape-point baked elevation for one directed edge, in travel direction, PARALLEL to `shp`.
@@ -230,7 +239,7 @@ std::string ValhallaActor::route(const std::string& request) {
             e.AddMember("shape", shape, al);
             if (!shp_elev.empty()) {
                 rapidjson::Value evarr(rapidjson::kArrayType);
-                for (float h : shp_elev) evarr.PushBack(h, al);
+                for (float h : shp_elev) evarr.PushBack(elevationOut(h), al);
                 e.AddMember("elevation", evarr, al);
             }
             edges.PushBack(e, al);
@@ -302,7 +311,7 @@ std::string ValhallaActor::trace_attributes(const std::string& request) {
             e.AddMember("shape", shape, al);
             if (!shp_elev.empty()) {
                 rapidjson::Value evarr(rapidjson::kArrayType);
-                for (float h : shp_elev) evarr.PushBack(h, al);
+                for (float h : shp_elev) evarr.PushBack(elevationOut(h), al);
                 e.AddMember("elevation", evarr, al);
             }
             graphEdges.PushBack(e, al);
@@ -506,7 +515,7 @@ std::string ValhallaActor::walk_forward(const std::string& request) {
         e.AddMember("shape", shape, al);
         if (!shp_elev.empty()) {
             rapidjson::Value evarr(rapidjson::kArrayType);
-            for (float h : shp_elev) evarr.PushBack(h, al);
+            for (float h : shp_elev) evarr.PushBack(elevationOut(h), al);
             e.AddMember("elevation", evarr, al);       // meters, one value per shape point
         }
         edges.PushBack(e, al);
